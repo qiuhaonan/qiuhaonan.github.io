@@ -1,0 +1,492 @@
+
+<!DOCTYPE html>
+<html lang="zh-cn">
+    
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="generator" content="Haonan&#39;s Blog">
+    <title>pcie-sigcomm2018 - Haonan&#39;s Blog</title>
+    <meta name="author" content="邱昊楠">
+    
+    
+    
+    <script type="application/ld+json">{"@context":"http://schema.org","@type":"BlogPosting","author":{"@type":"Person","name":"邱昊楠","sameAs":["https://github.com/qiuhaonan","979576490@qq.com"],"image":"avatar.jpg"},"articleBody":"[Paper]Understanding PCIe Performance for End Host Networking, SIGCOMM 2018[摘要]近些年来，受到可编程网卡发展和可用的刺激，主机端逐渐成为核心网络功能的落脚点，比如：负载均衡，拥塞控制和特定应用的网络卸载。然而，在可编程网卡上实现定制化设计没有那么容易：许多潜在的瓶颈会影响性能。\n这篇论文重点关注作为现代服务器的I/O互联关键构件-PCIe在与主机架构和设备驱动交互时的性能影响。我们提出一个用于研究PCIe的理论模型-pcie-bench，它是一个开源套件，允许开发者对PCIe的底层细节有更深和更精确的理解。通过使用pcie-bench，我们对现代服务器中的PCIe子系统进行了特征塑造。我们强调了PCIe实现之间惊人的差异，评估了PCIe特征如IOMMU的不良影响，并且展现了40Gb/s以上网卡的实际限制。更多的是，通过pcie-bench，我们获得了可以为商用和研究导向的网卡与DMA引擎提供软件和未来硬件架构发展导向的洞察点。\n[背景]主机端参与实现网络功能的想法已经被企业和数据中心网络探索的非常多了。此外，可编程NIC的颠覆性引入，以及混合Xeon和FPGA平台数据中心的部署，推动了对新的更好的解决方案的需求，这些解决方案结合了软件功能和硬件NIC加速，以提高终端主机网络性能，灵活性或两者通吃。有一些工作尝试利用主机端可编程硬件来改善数据中心的可扩展性或者特定的网络功能，比如：负载均衡，应用级别的QoS和拥塞控制。\n在本文里，我们将展示PCIe与主机架构和设备驱动的交互会显著的影响网络应用的性能。过去的研究主要考虑PCIe在特定环境下的影响，如RDMA，GPU加速的网络数据包处理，和优化的键值存储应用。相比而言，我们认为此时需要要一个更加通用的方法来研究和辨认PCIe特征，因为PCIe已经不仅对特殊的、高性能网络功能很重要，而且对存储适配器和定制加速卡如机器学习也相当重要。正是在这种环境下，我们引入一个PCIe的理论模型，设计一个方法来在真实系统中提取PCIe的特征，描述它的实现，并且展现使用我们的方法提取的结果。这允许我们对PCIe当前工作的方式和它对操作系统与应用设计的影响得出一些明确的结论。例如：我们演示了NUMA对PCIe设备和IOMMU会对应用的性能产生负面影响。\n[动机]传统上，商用系统中的I/O互联架构，如PCIe，没有被广泛的研究，因为它们已经有效的工作了许多年。只有当我们有I/O设备超过了PCIe的极限能力时，我们才能看到许多软硬件协同设计的方案。与此同时，许多新的软件架构也被提议出来，来避免传统网络栈的开销。\n但不幸的是，在40G和100G网卡上，即便结合软件栈优化，PCIe正在成为瓶颈。不仅如此，有严格延迟要求的现代网络应用会被PCIe设备中的DMA引擎和主机端PCIe的实现引入的延迟影响。最终，在基于现代x86的服务器中，PCIe的主机端实现已经在剧烈的变化，并且可替代的服务器架构也正在出现。\n[PCIe对网络应用吞吐量的影响]40Gbps网卡通常使用的一个PCIe 3代 x8接口在物理层可以达到62.96Gbps的吞吐量。然而，PCIe协议开销把可用带宽降到了50Gbps，或者更少，这取决于PCIe的访问模式。上面这张图给出了对于这样一个设备的有效双向带宽(Effective PCIe BW)。锯齿模式是由于传输的数据需要在PCIe协议下分片成更小的PCIe数据包造成的，它们带有自己的PCIe层头部。\n除了传输数据包本身，网卡还必须得读TX和freelist的描述符， 写回RX(有时也有TX)的描述符并产生中断。设备驱动还必须得读和更新设备上的队列指针。 所有这些交互都是PCIe事务，消耗额外的PCIe带宽。如果我们建模一个非常简单的网卡，它对每个数据包都会DMA独立的描述符且驱动为每个数据包都读/写队列指针，那么我们将会看到有效双向带宽的继续下滑(Simple NIC)。这样的设备只会在以太网帧大于512B的情况下达到40Gbps的线速吞吐量。因此，大多数网卡现在实现了大量的优化，比如: 批量入队描述符，预取描述符，中断节制等等。 这些机制增加了网卡的复杂性但达到可以接受的吞吐量。 图中Modern NIC(kernel driver)展示了这样一个适度优化的网卡/驱动结合一个典型的Linux内核驱动可以达到的吞吐量。现代软件框架，比如DPDK，可以在驱动层做更多优化。通过禁用中断和轮询写回描述符到主机内存中而非设备寄存器中，PCIe事务的数量被进一步降低，可以获得的带宽也进一步增加(Modern NIC(DPDK driver))。但是，这张图表明了在设计定制化卸载到可编程网卡时，开发者和研究者必须精确的感知由设备和设备驱动产生的PCIe事务带来的开销。\n[PCIe对网络应用延迟的影响]我们使用一个ExaNIC来测量PCIe在一个网络应用经历的完整主机端延迟所占的比例。这张图展示了结果。在ExaNIC上，PCIe子系统对于1500B数据包的延迟贡献了77%，而对于小数据包则贡献超过了90%的延迟。而且，这个范围的整体延迟已经被证明对一些常用的数据中心应用性能产生了负面影响。\n[NIC PCIe延迟的测量]上面的图解释了对于128B负载的RTT大概时1000ns，而PCIe消耗了900ns。在40Gbps以太网上，对于128B数据包要达到线速，一个新的数据包必须每隔30ns就要被接收或发送。假设这个延迟是对称的，这就暗示着NIC必须在每个方向处理30个并发的DMA来覆盖这些延迟而达到线速。考虑到网卡还需要发起对描述符的DMA，一个网卡需要处理的并发DMA数量就会更多。不仅如此，再考虑到系统中其他的延迟，这个数字只会增加不会减少。这不仅对为可编程网卡写优化软件引入了显著的复杂性，同时也对设备驱动施加了限制，因为设备驱动需要提供足够大的主机缓存来让网卡消耗。\n[PCIe root complex正在演变]在现代的基于x86的服务器中，PCIe root complex近年来发展迅速。具体来说，它与内存控制器一起紧密集成在CPU内核中，可以将PCIe设备与CPU缓存更紧密地集成，例如英特尔的数据直接I / O（DDIO)。对于多插槽系统，这种集成也会导致PCIe设备的非一致性内存访问（NUMA ）：某些DMA请求可能针对PCIe设备所连接的socket的本地内存，而其他DMA请求则需要遍历CPU互连结构。最后，大多数现代系统都有一个IOMMU插在PCIe设备和主机之间的数据路径中。 IOMMU执行地址的地址转换存在于PCIe事务中并利用内部事务旁视缓冲区（TLB）作为转换地址的缓存。在TLB未命中时，IOMMU必须执行整页表行走，这可能会延迟事务，从而可能增加延迟并影响吞吐量。这些最新技术不仅影响PCIe事务的总体延迟（和带宽），而且它们还引入了变量，因为事务现在取决于高速缓存的临时状态，IOMMU TLB和CPU互连的特性。此外，经过多年的基于x86单声道 服务器市场的文化，围绕ARM64和ARM设计的Power处理器都已获得主流部署。这些体系结构中的每一个都具有截然不同的I / O子系统实现，并且大多数相关细节都不公开，这使得研究人员难以表征和理解这些服务器体系结构之间的差异。当数据需要从硬件转移到软件（反之亦然）时，PCIe对吞吐量的影响，PCIe对整体NIC延迟的贡献，PCIe root complex中新技术的引入以及新主流的部署服务器架构都促使我们构建pcie-bench：以更好，更详细和系统地理解商品系统中的PCIe实现，并帮助开发人员微调应用程序以更有效地使用底层系统。\n","dateCreated":"2018-11-26T23:07:21+08:00","dateModified":"2018-11-26T23:16:37+08:00","datePublished":"2018-11-26T23:07:21+08:00","description":"","headline":"pcie-sigcomm2018","image":[],"mainEntityOfPage":{"@type":"WebPage","@id":"https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/"},"publisher":{"@type":"Organization","name":"邱昊楠","sameAs":["https://github.com/qiuhaonan","979576490@qq.com"],"image":"avatar.jpg","logo":{"@type":"ImageObject","url":"avatar.jpg"}},"url":"https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/","keywords":"Networking, Sigcomm"}</script>
+    <meta name="description" content="[Paper]Understanding PCIe Performance for End Host Networking, SIGCOMM 2018[摘要]近些年来，受到可编程网卡发展和可用的刺激，主机端逐渐成为核心网络功能的落脚点，比如：负载均衡，拥塞控制和特定应用的网络卸载。然而，在可编程网卡上实现定制化设计没有那么容易：许多潜在的瓶颈会影响性能。 这篇论文重点关注作为现代服务器的I/O互联">
+<meta name="keywords" content="Networking,Sigcomm">
+<meta property="og:type" content="blog">
+<meta property="og:title" content="pcie-sigcomm2018">
+<meta property="og:url" content="https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/index.html">
+<meta property="og:site_name" content="Haonan&#39;s Blog">
+<meta property="og:description" content="[Paper]Understanding PCIe Performance for End Host Networking, SIGCOMM 2018[摘要]近些年来，受到可编程网卡发展和可用的刺激，主机端逐渐成为核心网络功能的落脚点，比如：负载均衡，拥塞控制和特定应用的网络卸载。然而，在可编程网卡上实现定制化设计没有那么容易：许多潜在的瓶颈会影响性能。 这篇论文重点关注作为现代服务器的I/O互联">
+<meta property="og:locale" content="zh-cn">
+<meta property="og:image" content="https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/pcie-sigcomm2018/tput.png">
+<meta property="og:image" content="https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/pcie-sigcomm2018/lat.png">
+<meta property="og:updated_time" content="2018-11-26T15:16:37.510Z">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="pcie-sigcomm2018">
+<meta name="twitter:description" content="[Paper]Understanding PCIe Performance for End Host Networking, SIGCOMM 2018[摘要]近些年来，受到可编程网卡发展和可用的刺激，主机端逐渐成为核心网络功能的落脚点，比如：负载均衡，拥塞控制和特定应用的网络卸载。然而，在可编程网卡上实现定制化设计没有那么容易：许多潜在的瓶颈会影响性能。 这篇论文重点关注作为现代服务器的I/O互联">
+<meta name="twitter:image" content="https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/pcie-sigcomm2018/tput.png">
+    
+    
+        
+    
+    
+        <meta property="og:image" content="https://qiuhaonan.github.io/assets/images/avatar.jpg"/>
+    
+    
+    
+    
+    <!--STYLES-->
+    <link rel="stylesheet" href="/assets/css/style-du2xmrqdqrl2ollgeiw050kpl6l4nbyz7bumjuurjgsxyopifvukebxc9lqe.min.css">
+    <!--STYLES END-->
+    
+
+    
+</head>
+
+    <body>
+        <div id="blog">
+            <!-- Define author's picture -->
+
+
+    
+        
+            
+        
+    
+
+<header id="header" data-behavior="4">
+    <i id="btn-open-sidebar" class="fa fa-lg fa-bars"></i>
+    <div class="header-title">
+        <a class="header-title-link" href="/ ">Haonan&#39;s Blog</a>
+    </div>
+    
+        
+            <a class="header-right-picture " href="#about">
+        
+        
+            <img class="header-picture" src="/assets/images/avatar.jpg" alt="作者的图片">
+        
+        </a>
+    
+</header>
+
+            <!-- Define author's picture -->
+
+
+
+        
+    
+
+<nav id="sidebar" data-behavior="4">
+    <div class="sidebar-container">
+        
+            <div class="sidebar-profile">
+                <a href="/#about">
+                    <img class="sidebar-profile-picture" src="/assets/images/avatar.jpg" alt="作者的图片">
+                </a>
+                <h4 class="sidebar-profile-name">邱昊楠</h4>
+                
+                    <h5 class="sidebar-profile-bio"><p>一名有热情并正在努力的计算机科学工人和RDMA技术工人</p>
+</h5>
+                
+            </div>
+        
+        
+            <ul class="sidebar-buttons">
+            
+                <li class="sidebar-button">
+                    
+                        <a class="sidebar-button-link " href="/ " title="首页">
+                    
+                        <i class="sidebar-button-icon fa fa-home" aria-hidden="true"></i>
+                        <span class="sidebar-button-desc">首页</span>
+                    </a>
+            </li>
+            
+                <li class="sidebar-button">
+                    
+                        <a class="sidebar-button-link " href="/all-categories" title="分类">
+                    
+                        <i class="sidebar-button-icon fa fa-bookmark" aria-hidden="true"></i>
+                        <span class="sidebar-button-desc">分类</span>
+                    </a>
+            </li>
+            
+                <li class="sidebar-button">
+                    
+                        <a class="sidebar-button-link " href="/all-tags" title="标签">
+                    
+                        <i class="sidebar-button-icon fa fa-tags" aria-hidden="true"></i>
+                        <span class="sidebar-button-desc">标签</span>
+                    </a>
+            </li>
+            
+                <li class="sidebar-button">
+                    
+                        <a class="sidebar-button-link " href="/all-archives" title="归档">
+                    
+                        <i class="sidebar-button-icon fa fa-archive" aria-hidden="true"></i>
+                        <span class="sidebar-button-desc">归档</span>
+                    </a>
+            </li>
+            
+                <li class="sidebar-button">
+                    
+                        <a class="sidebar-button-link open-algolia-search" href="#search" title="搜索">
+                    
+                        <i class="sidebar-button-icon fa fa-search" aria-hidden="true"></i>
+                        <span class="sidebar-button-desc">搜索</span>
+                    </a>
+            </li>
+            
+                <li class="sidebar-button">
+                    
+                        <a class="sidebar-button-link " href="#about" title="关于">
+                    
+                        <i class="sidebar-button-icon fa fa-question" aria-hidden="true"></i>
+                        <span class="sidebar-button-desc">关于</span>
+                    </a>
+            </li>
+            
+        </ul>
+        
+            <ul class="sidebar-buttons">
+            
+                <li class="sidebar-button">
+                    
+                        <a class="sidebar-button-link " href="https://github.com/qiuhaonan" target="_blank" rel="noopener" title="GitHub">
+                    
+                        <i class="sidebar-button-icon fab fa-github" aria-hidden="true"></i>
+                        <span class="sidebar-button-desc">GitHub</span>
+                    </a>
+            </li>
+            
+                <li class="sidebar-button">
+                    
+                        <a class="sidebar-button-link " href="/979576490@qq.com" title="邮箱">
+                    
+                        <i class="sidebar-button-icon fa fa-envelope" aria-hidden="true"></i>
+                        <span class="sidebar-button-desc">邮箱</span>
+                    </a>
+            </li>
+            
+        </ul>
+        
+            <ul class="sidebar-buttons">
+            
+                <li class="sidebar-button">
+                    
+                        <a class="sidebar-button-link " href="/atom.xml" title="RSS">
+                    
+                        <i class="sidebar-button-icon fa fa-rss" aria-hidden="true"></i>
+                        <span class="sidebar-button-desc">RSS</span>
+                    </a>
+            </li>
+            
+        </ul>
+        
+    </div>
+</nav>
+
+            
+            <div id="main" data-behavior="4"
+                 class="
+                        hasCoverMetaIn
+                        ">
+                
+<article class="post">
+    
+    
+        <div class="post-header main-content-wrap text-left">
+    
+        <h1 class="post-title">
+            pcie-sigcomm2018
+        </h1>
+    
+    
+        <div class="post-meta">
+    <time datetime="2018-11-26T23:07:21+08:00">
+	
+		    11月 26, 2018
+    	
+    </time>
+    
+        <span>发布在 </span>
+        
+    <a class="category-link" href="/categories/Paper-Reading/">Paper Reading</a>
+
+
+    
+</div>
+
+    
+</div>
+
+    
+    <div class="post-content markdown">
+        <div class="main-content-wrap">
+            <h1 id="Paper-Understanding-PCIe-Performance-for-End-Host-Networking-SIGCOMM-2018"><a href="#Paper-Understanding-PCIe-Performance-for-End-Host-Networking-SIGCOMM-2018" class="headerlink" title="[Paper]Understanding PCIe Performance for End Host Networking, SIGCOMM 2018"></a>[Paper]Understanding PCIe Performance for End Host Networking, SIGCOMM 2018</h1><h2 id="摘要"><a href="#摘要" class="headerlink" title="[摘要]"></a>[摘要]</h2><p>近些年来，受到可编程网卡发展和可用的刺激，主机端逐渐成为核心网络功能的落脚点，比如：负载均衡，拥塞控制和特定应用的网络卸载。然而，在可编程网卡上实现定制化设计没有那么容易：许多潜在的瓶颈会影响性能。</p>
+<p>这篇论文重点关注作为现代服务器的I/O互联关键构件-PCIe在与主机架构和设备驱动交互时的性能影响。我们提出一个用于研究PCIe的理论模型-pcie-bench，它是一个开源套件，允许开发者对PCIe的底层细节有更深和更精确的理解。通过使用pcie-bench，我们对现代服务器中的PCIe子系统进行了特征塑造。我们强调了PCIe实现之间惊人的差异，评估了PCIe特征如IOMMU的不良影响，并且展现了40Gb/s以上网卡的实际限制。更多的是，通过pcie-bench，我们获得了可以为商用和研究导向的网卡与DMA引擎提供软件和未来硬件架构发展导向的洞察点。</p>
+<h2 id="背景"><a href="#背景" class="headerlink" title="[背景]"></a>[背景]</h2><p>主机端参与实现网络功能的想法已经被企业和数据中心网络探索的非常多了。此外，可编程NIC的颠覆性引入，以及混合Xeon和FPGA平台数据中心的部署，推动了对新的更好的解决方案的需求，这些解决方案结合了软件功能和硬件NIC加速，以提高终端主机网络性能，灵活性或两者通吃。有一些工作尝试利用主机端可编程硬件来改善数据中心的可扩展性或者特定的网络功能，比如：负载均衡，应用级别的QoS和拥塞控制。</p>
+<p>在本文里，我们将展示PCIe与主机架构和设备驱动的交互会显著的影响网络应用的性能。过去的研究主要考虑PCIe在特定环境下的影响，如RDMA，GPU加速的网络数据包处理，和优化的键值存储应用。相比而言，我们认为此时需要要一个更加通用的方法来研究和辨认PCIe特征，因为PCIe已经不仅对特殊的、高性能网络功能很重要，而且对存储适配器和定制加速卡如机器学习也相当重要。正是在这种环境下，我们引入一个PCIe的理论模型，设计一个方法来在真实系统中提取PCIe的特征，描述它的实现，并且展现使用我们的方法提取的结果。这允许我们对PCIe当前工作的方式和它对操作系统与应用设计的影响得出一些明确的结论。例如：我们演示了NUMA对PCIe设备和IOMMU会对应用的性能产生负面影响。</p>
+<h2 id="动机"><a href="#动机" class="headerlink" title="[动机]"></a>[动机]</h2><p>传统上，商用系统中的I/O互联架构，如PCIe，没有被广泛的研究，因为它们已经有效的工作了许多年。只有当我们有I/O设备超过了PCIe的极限能力时，我们才能看到许多软硬件协同设计的方案。与此同时，许多新的软件架构也被提议出来，来避免传统网络栈的开销。</p>
+<p>但不幸的是，在40G和100G网卡上，即便结合软件栈优化，PCIe正在成为瓶颈。不仅如此，有严格延迟要求的现代网络应用会被PCIe设备中的DMA引擎和主机端PCIe的实现引入的延迟影响。最终，在基于现代x86的服务器中，PCIe的主机端实现已经在剧烈的变化，并且可替代的服务器架构也正在出现。</p>
+<h3 id="PCIe对网络应用吞吐量的影响"><a href="#PCIe对网络应用吞吐量的影响" class="headerlink" title="[PCIe对网络应用吞吐量的影响]"></a>[PCIe对网络应用吞吐量的影响]</h3><p><img src="pcie-sigcomm2018/tput.png" alt="tput"><br>40Gbps网卡通常使用的一个PCIe 3代 x8接口在物理层可以达到62.96Gbps的吞吐量。然而，PCIe协议开销把可用带宽降到了50Gbps，或者更少，这取决于PCIe的访问模式。上面这张图给出了对于这样一个设备的有效双向带宽(Effective PCIe BW)。锯齿模式是由于传输的数据需要在PCIe协议下分片成更小的PCIe数据包造成的，它们带有自己的PCIe层头部。</p>
+<p><strong>除了传输数据包本身，网卡还必须得读TX和freelist的描述符， 写回RX(有时也有TX)的描述符并产生中断。设备驱动还必须得读和更新设备上的队列指针。</strong> 所有这些交互都是PCIe事务，消耗额外的PCIe带宽。如果我们建模一个非常简单的网卡，它对每个数据包都会DMA独立的描述符且驱动为每个数据包都读/写队列指针，那么我们将会看到有效双向带宽的继续下滑(Simple NIC)。这样的设备只会在以太网帧大于512B的情况下达到40Gbps的线速吞吐量。<strong>因此，大多数网卡现在实现了大量的优化，比如: 批量入队描述符，预取描述符，中断节制等等。 这些机制增加了网卡的复杂性但达到可以接受的吞吐量。</strong> 图中Modern NIC(kernel driver)展示了这样一个适度优化的网卡/驱动结合一个典型的Linux内核驱动可以达到的吞吐量。现代软件框架，比如DPDK，可以在驱动层做更多优化。<strong>通过禁用中断和轮询写回描述符到主机内存中而非设备寄存器中，PCIe事务的数量被进一步降低，可以获得的带宽也进一步增加(Modern NIC(DPDK driver))。但是，这张图表明了在设计定制化卸载到可编程网卡时，开发者和研究者必须精确的感知由设备和设备驱动产生的PCIe事务带来的开销。</strong></p>
+<h3 id="PCIe对网络应用延迟的影响"><a href="#PCIe对网络应用延迟的影响" class="headerlink" title="[PCIe对网络应用延迟的影响]"></a>[PCIe对网络应用延迟的影响]</h3><p><img src="pcie-sigcomm2018/lat.png" alt="lat"><br>我们使用一个ExaNIC来测量PCIe在一个网络应用经历的完整主机端延迟所占的比例。这张图展示了结果。在ExaNIC上，PCIe子系统对于1500B数据包的延迟贡献了77%，而对于小数据包则贡献超过了90%的延迟。而且，这个范围的整体延迟已经被证明对一些常用的数据中心应用性能产生了负面影响。</p>
+<h3 id="NIC-PCIe延迟的测量"><a href="#NIC-PCIe延迟的测量" class="headerlink" title="[NIC PCIe延迟的测量]"></a>[NIC PCIe延迟的测量]</h3><p>上面的图解释了对于128B负载的RTT大概时1000ns，而PCIe消耗了900ns。在40Gbps以太网上，对于128B数据包要达到线速，一个新的数据包必须每隔30ns就要被接收或发送。假设这个延迟是对称的，这就暗示着NIC必须在每个方向处理30个并发的DMA来覆盖这些延迟而达到线速。考虑到网卡还需要发起对描述符的DMA，一个网卡需要处理的并发DMA数量就会更多。不仅如此，再考虑到系统中其他的延迟，这个数字只会增加不会减少。这不仅对为可编程网卡写优化软件引入了显著的复杂性，同时也对设备驱动施加了限制，因为设备驱动需要提供足够大的主机缓存来让网卡消耗。</p>
+<h3 id="PCIe-root-complex正在演变"><a href="#PCIe-root-complex正在演变" class="headerlink" title="[PCIe root complex正在演变]"></a>[PCIe root complex正在演变]</h3><p>在现代的基于x86的服务器中，PCIe root complex近年来发展迅速。具体来说，它与内存控制器一起紧密集成在CPU内核中，可以将PCIe设备与CPU缓存更紧密地集成，例如英特尔的数据直接I / O（DDIO)。对于多插槽系统，这种集成也会导致PCIe设备的非一致性内存访问（NUMA ）：某些DMA请求可能针对PCIe设备所连接的socket的本地内存，而其他DMA请求则需要遍历CPU互连结构。最后，大多数现代系统都有一个IOMMU插在PCIe设备和主机之间的数据路径中。 IOMMU执行地址的地址转换存在于PCIe事务中并利用内部事务旁视缓冲区（TLB）作为转换地址的缓存。在TLB未命中时，IOMMU必须执行整页表行走，这可能会延迟事务，从而可能增加延迟并影响吞吐量。这些最新技术不仅影响PCIe事务的总体延迟（和带宽），而且它们还引入了变量，因为事务现在取决于高速缓存的临时状态，IOMMU TLB和CPU互连的特性。此外，经过多年的基于x86单声道 服务器市场的文化，围绕ARM64和ARM设计的Power处理器都已获得主流部署。这些体系结构中的每一个都具有截然不同的I / O子系统实现，并且大多数相关细节都不公开，这使得研究人员难以表征和理解这些服务器体系结构之间的差异。当数据需要从硬件转移到软件（反之亦然）时，PCIe对吞吐量的影响，PCIe对整体NIC延迟的贡献，PCIe root complex中新技术的引入以及新主流的部署服务器架构都促使我们构建pcie-bench：以更好，更详细和系统地理解商品系统中的PCIe实现，并帮助开发人员微调应用程序以更有效地使用底层系统。</p>
+
+            
+
+        </div>
+    </div>
+    <div id="post-footer" class="post-footer main-content-wrap">
+        
+            <div class="post-footer-tags">
+                <span class="text-color-light text-small">标签</span><br>
+                
+    <a class="tag tag--primary tag--small t-link" href="/tags/Networking/">Networking</a> <a class="tag tag--primary tag--small t-link" href="/tags/Sigcomm/">Sigcomm</a>
+
+            </div>
+        
+        
+            <div class="post-actions-wrap">
+    <nav>
+        <ul class="post-actions post-action-nav">
+            <li class="post-action">
+                
+                    <a class="post-action-btn btn btn--disabled">
+                
+                    <i class="fa fa-angle-left" aria-hidden="true"></i>
+                    <span class="hide-xs hide-sm text-small icon-ml">上一篇</span>
+                </a>
+            </li>
+            <li class="post-action">
+                
+                    
+                    <a class="post-action-btn btn btn--default tooltip--top" href="/2018/11/23/hello-world/" data-tooltip="Hello World" aria-label="下一篇: Hello World">
+                
+                    <span class="hide-xs hide-sm text-small icon-mr">下一篇</span>
+                    <i class="fa fa-angle-right" aria-hidden="true"></i>
+                </a>
+            </li>
+        </ul>
+    </nav>
+    <ul class="post-actions post-action-share">
+        <li class="post-action hide-lg hide-md hide-sm">
+            <a class="post-action-btn btn btn--default btn-open-shareoptions" href="#btn-open-shareoptions" aria-label="Diesen Beitrag teilen">
+                <i class="fa fa-share-alt" aria-hidden="true"></i>
+            </a>
+        </li>
+        
+            
+            
+            <li class="post-action hide-xs">
+                <a class="post-action-btn btn btn--default" target="new" href="https://www.facebook.com/sharer/sharer.php?u=https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/" title="分享到 Facebook">
+                    <i class="fab fa-facebook" aria-hidden="true"></i>
+                </a>
+            </li>
+        
+            
+            
+            <li class="post-action hide-xs">
+                <a class="post-action-btn btn btn--default" target="new" href="https://twitter.com/intent/tweet?text=https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/" title="分享到 Twitter">
+                    <i class="fab fa-twitter" aria-hidden="true"></i>
+                </a>
+            </li>
+        
+            
+            
+            <li class="post-action hide-xs">
+                <a class="post-action-btn btn btn--default" target="new" href="https://plus.google.com/share?url=https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/" title="分享到 Google+">
+                    <i class="fab fa-google-plus" aria-hidden="true"></i>
+                </a>
+            </li>
+        
+        
+            
+        
+        <li class="post-action">
+            
+                <a class="post-action-btn btn btn--default" href="#" aria-label="Nach oben">
+            
+                <i class="fa fa-list" aria-hidden="true"></i>
+            </a>
+        </li>
+    </ul>
+</div>
+
+
+        
+        
+            
+        
+    </div>
+</article>
+
+
+
+                <footer id="footer" class="main-content-wrap">
+    <span class="copyrights">
+        Copyrights &copy; 2018 邱昊楠. All Rights Reserved.
+    </span>
+</footer>
+
+            </div>
+            
+                <div id="bottom-bar" class="post-bottom-bar" data-behavior="4">
+                    <div class="post-actions-wrap">
+    <nav>
+        <ul class="post-actions post-action-nav">
+            <li class="post-action">
+                
+                    <a class="post-action-btn btn btn--disabled">
+                
+                    <i class="fa fa-angle-left" aria-hidden="true"></i>
+                    <span class="hide-xs hide-sm text-small icon-ml">上一篇</span>
+                </a>
+            </li>
+            <li class="post-action">
+                
+                    
+                    <a class="post-action-btn btn btn--default tooltip--top" href="/2018/11/23/hello-world/" data-tooltip="Hello World" aria-label="下一篇: Hello World">
+                
+                    <span class="hide-xs hide-sm text-small icon-mr">下一篇</span>
+                    <i class="fa fa-angle-right" aria-hidden="true"></i>
+                </a>
+            </li>
+        </ul>
+    </nav>
+    <ul class="post-actions post-action-share">
+        <li class="post-action hide-lg hide-md hide-sm">
+            <a class="post-action-btn btn btn--default btn-open-shareoptions" href="#btn-open-shareoptions" aria-label="Diesen Beitrag teilen">
+                <i class="fa fa-share-alt" aria-hidden="true"></i>
+            </a>
+        </li>
+        
+            
+            
+            <li class="post-action hide-xs">
+                <a class="post-action-btn btn btn--default" target="new" href="https://www.facebook.com/sharer/sharer.php?u=https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/" title="分享到 Facebook">
+                    <i class="fab fa-facebook" aria-hidden="true"></i>
+                </a>
+            </li>
+        
+            
+            
+            <li class="post-action hide-xs">
+                <a class="post-action-btn btn btn--default" target="new" href="https://twitter.com/intent/tweet?text=https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/" title="分享到 Twitter">
+                    <i class="fab fa-twitter" aria-hidden="true"></i>
+                </a>
+            </li>
+        
+            
+            
+            <li class="post-action hide-xs">
+                <a class="post-action-btn btn btn--default" target="new" href="https://plus.google.com/share?url=https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/" title="分享到 Google+">
+                    <i class="fab fa-google-plus" aria-hidden="true"></i>
+                </a>
+            </li>
+        
+        
+            
+        
+        <li class="post-action">
+            
+                <a class="post-action-btn btn btn--default" href="#" aria-label="Nach oben">
+            
+                <i class="fa fa-list" aria-hidden="true"></i>
+            </a>
+        </li>
+    </ul>
+</div>
+
+
+                </div>
+                <div id="share-options-bar" class="share-options-bar" data-behavior="4">
+    <i id="btn-close-shareoptions" class="fa fa-times"></i>
+    <ul class="share-options">
+        
+            
+            
+            <li class="share-option">
+                <a class="share-option-btn" target="new" href="https://www.facebook.com/sharer/sharer.php?u=https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/">
+                    <i class="fab fa-facebook" aria-hidden="true"></i><span>分享到 Facebook</span>
+                </a>
+            </li>
+        
+            
+            
+            <li class="share-option">
+                <a class="share-option-btn" target="new" href="https://twitter.com/intent/tweet?text=https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/">
+                    <i class="fab fa-twitter" aria-hidden="true"></i><span>分享到 Twitter</span>
+                </a>
+            </li>
+        
+            
+            
+            <li class="share-option">
+                <a class="share-option-btn" target="new" href="https://plus.google.com/share?url=https://qiuhaonan.github.io/2018/11/26/pcie-sigcomm2018/">
+                    <i class="fab fa-google-plus" aria-hidden="true"></i><span>分享到 Google+</span>
+                </a>
+            </li>
+        
+    </ul>
+</div>
+
+            
+        </div>
+        
+
+
+    
+        
+    
+
+<div id="about">
+    <div id="about-card">
+        <div id="about-btn-close">
+            <i class="fa fa-times"></i>
+        </div>
+        
+            <img id="about-card-picture" src="/assets/images/avatar.jpg" alt="作者的图片">
+        
+            <h4 id="about-card-name">邱昊楠</h4>
+        
+            <div id="about-card-bio"><p>一名有热情并正在努力的计算机科学工人和RDMA技术工人</p>
+</div>
+        
+        
+            <div id="about-card-job">
+                <i class="fa fa-briefcase"></i>
+                <br>
+                <p>让生活变得更好</p>
+
+            </div>
+        
+        
+            <div id="about-card-location">
+                <i class="fa fa-map-marker-alt"></i>
+                <br>
+                南京/北京
+            </div>
+        
+    </div>
+</div>
+
+        
+        
+<div id="cover" style="background-image:url('/assets/images/cover.jpg');"></div>
+        <!--SCRIPTS-->
+<script src="/assets/js/script-vufjrm3fmbuttogo1hxuu0w9w0sesk5iyysjuguc2hdhufot9szxg8twijry.min.js"></script>
+<!--SCRIPTS END-->
+
+    
+
+
+
+    </body>
+</html>
